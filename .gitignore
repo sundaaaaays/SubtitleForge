@@ -1,0 +1,34 @@
+# 虚拟环境
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 模型（229MB，超过 GitHub 单文件 100MB 上限，单独分发）
+models/
+!models/.gitkeep
+
+# 测试音频（体积与本机相关，不入库；见 testdata/README.md）
+testdata/*
+!testdata/README.md
+
+# 打包产物
+dist/
+build/work/
+build/SubtitleForge/
+*.spec.bak
+
+# 运行时产物与诊断日志
+selftest.log
+startup.log
+args.log
+*.log
+!docs/*.md
+data/
+tmpout/
+
+# IDE
+.idea/
+.vscode/
+*.iml
