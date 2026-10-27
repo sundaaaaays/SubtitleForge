@@ -7,6 +7,15 @@ Windows 本地离线字幕生成工具。把音频 / 视频转成 SRT 字幕和 
 - 导出 SRT / TXT / VTT，支持 UTF-8 BOM、GBK 等编码
 - 完全离线：不发起任何网络请求，断网、内网隔离环境都能用
 
+## 直接下载（普通用户看这里）
+
+不想碰代码的话，去 [Releases](https://github.com/sundaaaaays/SubtitleForge/releases) 下载
+`SubtitleForge-v0.1.0-win64.zip`（253MB），解压后双击 `SubtitleForge.exe` 就能用。
+
+免安装、不写注册表、不需要装 Python 或 FFmpeg，模型已打包在内。
+
+系统要求：Windows 10 / 11 64 位，内存 4GB 以上。
+
 ---
 
 ## 一、快速开始（开发环境）
