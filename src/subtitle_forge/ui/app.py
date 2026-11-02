@@ -225,18 +225,26 @@ def main(argv: list[str] | None = None) -> int:
     boot.append(f"assets_dir={adir}")
     for name in ("arrow-down.svg", "arrow-up.svg", "check.svg"):
         boot.append(f"  {name}: {os.path.isfile(os.path.join(adir, name))}")
-    qss = build_stylesheet()
-    boot.append(f"qss_len={len(qss)} placeholder_left={'__ASSETS__' in qss}")
+
+    # 主题要在建窗口之前就定下来，否则会先闪一下浅色再切深色
+    from PySide6.QtCore import QSettings
+
+    theme = QSettings("SubtitleForge", "SubtitleForge").value("theme", "light")
+    boot.append(f"theme={theme}")
+    qss = build_stylesheet(theme)
+    boot.append(f"qss_len={len(qss)} placeholder_left={'__' in qss}")
 
     app = QApplication(argv)
     app.setApplicationName("SubtitleForge")
     app.setApplicationDisplayName("字幕工坊")
     app.setOrganizationName("SubtitleForge")
     _setup_font(app)
-    app.setStyleSheet(build_stylesheet())
+    app.setStyleSheet(qss)
 
     win = MainWindow()
     boot.append("mainwindow_built=True")
+    boot.append(f"tabs={win.tabs.count()} docs={len(win.docs)}")
+    boot.append(f"video_output={win.preview.has_video_output} player={win.preview.available}")
     win.show()
     boot.append(f"shown=True size={win.width()}x{win.height()}")
     _startup_log(boot)

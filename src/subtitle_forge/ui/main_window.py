@@ -1,23 +1,28 @@
 # -*- coding: utf-8 -*-
-"""主窗口。"""
+"""主窗口。
+
+界面分区：
+  左  文件列表 / 视频预览 / 识别参数（可折叠） / 操作按钮
+  右  进度 + 每个文件一个标签页的字幕表格 + 播放条 + 导出
+
+多文件互不覆盖靠的是「一个文件一份 Document + 一个 DocView」，
+标签页只是把它们摆出来。
+"""
 from __future__ import annotations
 
 import os
 import sys
-import traceback
 from typing import List, Optional
 
-from PySide6.QtCore import QTimer, Qt, QUrl
-from PySide6.QtGui import QAction, QColor, QFont, QKeySequence, QShortcut
+from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -27,21 +32,26 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QSplitter,
-    QTableWidget,
-    QTableWidgetItem,
+    QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from ..audio.decoder import ALL_EXT, find_ffmpeg, probe
 from ..core import exporters
-from ..core.models import Cue, ExportOptions, SplitOptions
-from ..core.pipeline import TranscribeConfig
-from ..core.textutil import ms_to_srt, parse_timecode, visual_width
-from .styles import COLORS, QSS
+from ..core.models import ExportOptions, SplitOptions
+from ..core.pipeline import TranscribeConfig, TranscriptionPipeline
+from ..core.textutil import ms_to_srt
+from .. import __version__
+from .document import Document, DocView
+from .preview import PreviewPanel
+from .styles import palette
 from .worker import TranscribeWorker
 
 APP_TITLE = "字幕工坊 SubtitleForge"
+ORG = "SubtitleForge"
+APP = "SubtitleForge"
 
 LANG_ITEMS = [
     ("自动检测", "auto"),
@@ -109,26 +119,84 @@ def resolve_model():
     return "demo", {}
 
 
+class CollapsibleCard(QFrame):
+    """带折叠头的卡片。收起后只留一条标题，省出空间给预览窗。"""
+
+    toggled = Signal(bool)
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Card")
+        self._title = title
+        self._expanded = True
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 8, 12, 10)
+        outer.setSpacing(8)
+
+        self.head = QPushButton()
+        self.head.setObjectName("CollapseHead")
+        self.head.setCursor(Qt.PointingHandCursor)
+        self.head.clicked.connect(self.toggle)
+        outer.addWidget(self.head)
+
+        self.body = QWidget()
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(0, 0, 0, 0)
+        self.body_layout.setSpacing(9)
+        outer.addWidget(self.body)
+
+        self._sync_text()
+
+    def _sync_text(self) -> None:
+        arrow = "▾" if self._expanded else "▸"
+        self.head.setText(f"{arrow}  {self._title}")
+
+    def toggle(self) -> None:
+        self.set_expanded(not self._expanded)
+
+    def set_expanded(self, on: bool) -> None:
+        self._expanded = on
+        self.body.setVisible(on)
+        self._sync_text()
+        self.toggled.emit(on)
+
+    def add_layout(self, lay) -> None:
+        self.body_layout.addLayout(lay)
+
+    def add_widget(self, w: QWidget) -> None:
+        self.body_layout.addWidget(w)
+
+    @property
+    def expanded(self) -> bool:
+        return self._expanded
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        self.resize(1180, 760)
-        self.setMinimumSize(940, 620)
+        self.resize(1240, 800)
+        self.setMinimumSize(1080, 680)
 
-        self._files: List[dict] = []
-        self._cues: List[Cue] = []
-        self._result = None
+        self.docs: List[Document] = []
+        self.current: Optional[Document] = None
         self._engine = None
         self._worker: Optional[TranscribeWorker] = None
-        self._playing_row = -1
-        self._stop_at_ms = -1
-        self._dirty = False
+        self._worker_doc: Optional[Document] = None
+        self._queue: List[Document] = []
+        self._batch_total = 0
+        self._batch_done = 0
+        self._batch_failed = 0
+        self._syncing = False
+
+        self.settings = QSettings(ORG, APP)
+        self.theme = self.settings.value("theme", "light")
 
         self._build_ui()
-        self._build_player()
         self._build_shortcuts()
         self._refresh_model_badge()
+        self._apply_theme()
         self.setAcceptDrops(True)
 
     # ================================================================ UI 构建
@@ -152,11 +220,10 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._build_right())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([330, 830])
+        splitter.setSizes([352, 860])
 
         body_layout.addWidget(splitter)
         root.addWidget(body, 1)
-        root.addWidget(self._build_footer())
 
         self.setCentralWidget(central)
         self._build_statusbar()
@@ -172,7 +239,7 @@ class MainWindow(QMainWindow):
         titles.setSpacing(1)
         t = QLabel(APP_TITLE)
         t.setObjectName("HeaderTitle")
-        s = QLabel("本地离线音视频转字幕 · 导出 SRT / TXT")
+        s = QLabel(f"本地离线音视频转字幕 · 导出 SRT / TXT · v{__version__}")
         s.setObjectName("HeaderSub")
         titles.addWidget(t)
         titles.addWidget(s)
@@ -183,8 +250,13 @@ class MainWindow(QMainWindow):
         self.badge_model.setObjectName("Hint")
         lay.addWidget(self.badge_model)
 
+        self.btn_theme = QPushButton("夜间模式")
+        self.btn_theme.setObjectName("Ghost")
+        self.btn_theme.setToolTip("切换深色 / 浅色外观（Ctrl+D）")
+        self.btn_theme.clicked.connect(self._toggle_theme)
+        lay.addWidget(self.btn_theme)
+
         btn_open_dir = QPushButton("模型目录")
-        btn_open_dir.setToolTip("打开模型所在目录")
         btn_open_dir.clicked.connect(self._open_model_dir)
         lay.addWidget(btn_open_dir)
 
@@ -192,11 +264,11 @@ class MainWindow(QMainWindow):
 
     def _build_left(self) -> QWidget:
         panel = QWidget()
-        panel.setMinimumWidth(310)
-        panel.setMaximumWidth(400)
+        panel.setMinimumWidth(330)
+        panel.setMaximumWidth(440)
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(10)
+        lay.setSpacing(8)
 
         # ---- 文件列表 ----
         card1 = self._card()
@@ -215,7 +287,7 @@ class MainWindow(QMainWindow):
         c1.addLayout(head)
 
         self.file_list = QListWidget()
-        self.file_list.setMinimumHeight(120)
+        self.file_list.setMinimumHeight(86)
         self.file_list.currentRowChanged.connect(self._on_file_selected)
         c1.addWidget(self.file_list, 1)
 
@@ -230,61 +302,86 @@ class MainWindow(QMainWindow):
         c1.addLayout(row)
         lay.addWidget(card1, 1)
 
-        # ---- 参数 ----
-        card2 = self._card()
-        c2 = QVBoxLayout(card2)
-        c2.setContentsMargins(12, 10, 12, 12)
-        c2.setSpacing(9)
+        # ---- 视频预览（左侧中间） ----
+        card_prev = self._card()
+        cp = QVBoxLayout(card_prev)
+        cp.setContentsMargins(10, 8, 10, 10)
+        cp.setSpacing(6)
 
-        t2 = QLabel("识别参数")
-        t2.setObjectName("CardTitle")
-        c2.addWidget(t2)
+        ph = QHBoxLayout()
+        t_prev = QLabel("视频预览")
+        t_prev.setObjectName("CardTitle")
+        ph.addWidget(t_prev)
+        ph.addStretch(1)
+        self.btn_play_prev = QPushButton("▶ 播放")
+        self.btn_play_prev.setObjectName("Ghost")
+        self.btn_play_prev.clicked.connect(self._toggle_play)
+        ph.addWidget(self.btn_play_prev)
+        cp.addLayout(ph)
+
+        self.preview = PreviewPanel()
+        self.preview.setFixedHeight(168)
+        self.preview.positionChanged.connect(self._on_preview_pos)
+        self.preview.playingChanged.connect(self._on_playing_changed)
+        cp.addWidget(self.preview)
+        lay.addWidget(card_prev)
+
+        # ---- 识别参数（可折叠） ----
+        self.params = CollapsibleCard("识别参数")
+        self.params.set_expanded(False)
+        self.params.toggled.connect(self._on_params_toggled)
 
         self.cmb_lang = QComboBox()
         for label, _ in LANG_ITEMS:
             self.cmb_lang.addItem(label)
-        c2.addLayout(self._field("语言", self.cmb_lang))
+        self.params.add_layout(self._field("语言", self.cmb_lang))
 
         self.cmb_env = QComboBox()
         for label, _ in ENV_ITEMS:
             self.cmb_env.addItem(label)
-        c2.addLayout(self._field("环境", self.cmb_env))
+        self.params.add_layout(self._field("环境", self.cmb_env))
 
         self.spin_chars = QSpinBox()
         self.spin_chars.setRange(6, 40)
         self.spin_chars.setValue(18)
         self.spin_chars.setSuffix(" 字")
-        c2.addLayout(self._field("单条字数", self.spin_chars))
+        self.params.add_layout(self._field("单条字数", self.spin_chars))
 
         self.spin_dur = QDoubleSpinBox()
         self.spin_dur.setRange(1.5, 15.0)
         self.spin_dur.setSingleStep(0.5)
         self.spin_dur.setValue(6.0)
         self.spin_dur.setSuffix(" 秒")
-        c2.addLayout(self._field("单条时长", self.spin_dur))
+        self.params.add_layout(self._field("单条时长", self.spin_dur))
 
         self.spin_gap = QDoubleSpinBox()
         self.spin_gap.setRange(0.2, 3.0)
         self.spin_gap.setSingleStep(0.1)
         self.spin_gap.setValue(0.6)
         self.spin_gap.setSuffix(" 秒")
-        c2.addLayout(self._field("静音断句", self.spin_gap))
+        self.params.add_layout(self._field("静音断句", self.spin_gap))
 
-        lay.addWidget(card2)
+        lay.addWidget(self.params)
 
         # ---- 操作按钮 ----
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+
         self.btn_start = QPushButton("开始转写")
         self.btn_start.setObjectName("Primary")
         self.btn_start.setMinimumHeight(38)
         self.btn_start.clicked.connect(self._start)
-        lay.addWidget(self.btn_start)
+        actions.addWidget(self.btn_start, 1)
 
         self.btn_cancel = QPushButton("取消")
         self.btn_cancel.setObjectName("Danger")
+        self.btn_cancel.setFixedWidth(82)
+        self.btn_cancel.setMinimumHeight(38)
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self._cancel)
-        lay.addWidget(self.btn_cancel)
-        lay.addSpacing(4)
+        actions.addWidget(self.btn_cancel)
+
+        lay.addLayout(actions)
 
         return panel
 
@@ -294,7 +391,6 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
 
-        # ---- 进度 ----
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
@@ -306,29 +402,25 @@ class MainWindow(QMainWindow):
         self.lbl_stage.setObjectName("Hint")
         lay.addWidget(self.lbl_stage)
 
-        # ---- 表格 ----
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["#", "开始", "结束", "时长", "文本"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setAlternatingRowColors(True)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.table.setEditTriggers(
-            QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked
+        # ---- 每个文件一个标签页 ----
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(False)
+        self.tabs.setMovable(True)
+        self.tabs.setElideMode(Qt.ElideMiddle)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        self.empty_page = QLabel(
+            "把音视频文件拖进窗口，或点左侧「添加文件」\n\n"
+            "每个文件都会有自己的标签页，互不覆盖"
         )
-        hh = self.table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.Fixed)
-        hh.setSectionResizeMode(1, QHeaderView.Fixed)
-        hh.setSectionResizeMode(2, QHeaderView.Fixed)
-        hh.setSectionResizeMode(3, QHeaderView.Fixed)
-        hh.setSectionResizeMode(4, QHeaderView.Stretch)
-        self.table.setColumnWidth(0, 46)
-        self.table.setColumnWidth(1, 100)
-        self.table.setColumnWidth(2, 100)
-        self.table.setColumnWidth(3, 66)
-        self.table.itemChanged.connect(self._on_item_changed)
-        self.table.cellClicked.connect(self._on_cell_clicked)
-        lay.addWidget(self.table, 1)
+        self.empty_page.setObjectName("EmptyHint")
+        self.empty_page.setAlignment(Qt.AlignCenter)
+
+        self.right_stack = QStackedWidget()
+        self.right_stack.addWidget(self.empty_page)
+        self.right_stack.addWidget(self.tabs)
+        self.right_stack.setCurrentIndex(0)
+        lay.addWidget(self.right_stack, 1)
 
         # ---- 播放条 ----
         play_row = QHBoxLayout()
@@ -401,11 +493,6 @@ class MainWindow(QMainWindow):
         lay.addWidget(card)
         return panel
 
-    def _build_footer(self) -> QWidget:
-        w = QWidget()
-        w.setFixedHeight(0)
-        return w
-
     def _build_statusbar(self) -> None:
         sb = self.statusBar()
         self.lbl_sb_left = QLabel("就绪")
@@ -422,8 +509,7 @@ class MainWindow(QMainWindow):
 
     def _vline(self) -> QFrame:
         f = QFrame()
-        f.setFrameShape(QFrame.VLine)
-        f.setStyleSheet("color: #e4e4e0;")
+        f.setObjectName("VLine")
         f.setFixedWidth(1)
         return f
 
@@ -441,64 +527,31 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence.Open, self, self._pick_files)
         QShortcut(QKeySequence("Ctrl+R"), self, self._start)
         QShortcut(QKeySequence("Ctrl+E"), self, self._export)
+        QShortcut(QKeySequence("Space"), self, self._toggle_play)
+        QShortcut(QKeySequence("Ctrl+D"), self, self._toggle_theme)
 
-    # ================================================================ 播放
+    # ================================================================ 主题
 
-    def _build_player(self) -> None:
-        self._player = None
-        self._audio = None
-        try:
-            from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+    def _toggle_theme(self) -> None:
+        self.theme = "dark" if self.theme != "dark" else "light"
+        self.settings.setValue("theme", self.theme)
+        self._apply_theme()
 
-            self._player = QMediaPlayer(self)
-            self._audio = QAudioOutput(self)
-            self._audio.setVolume(0.85)
-            self._player.setAudioOutput(self._audio)
-            self._timer = QTimer(self)
-            self._timer.setInterval(80)
-            self._timer.timeout.connect(self._on_play_tick)
-        except Exception:
-            self._player = None
+    def _apply_theme(self) -> None:
+        from PySide6.QtWidgets import QApplication
 
-    def _load_media(self, wav_path: str) -> None:
-        if self._player is None:
-            return
-        if not wav_path or not os.path.isfile(wav_path):
-            return
-        from PySide6.QtMultimedia import QMediaPlayer
+        from .styles import build_stylesheet
 
-        self._player.setSource(QUrl.fromLocalFile(wav_path))
-        self._player.setPlaybackRate(1.0)
-        _ = QMediaPlayer
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_stylesheet(self.theme))
+        self.btn_theme.setText("日间模式" if self.theme == "dark" else "夜间模式")
+        self.preview.canvas.set_border(palette(self.theme)["line"])
+        self._refresh_model_badge()
 
-    def _toggle_play(self) -> None:
-        if self._player is None or self._result is None:
-            return
-        row = self.table.currentRow()
-        if row < 0 or row >= len(self._cues):
-            return
-        self._play_row(row)
-
-    def _play_row(self, row: int) -> None:
-        if self._player is None or not self._cues:
-            return
-        cue = self._cues[row]
-        self._playing_row = row
-        self._stop_at_ms = cue.end_ms
-        self._player.setPosition(max(0, cue.start_ms - 150))
-        self._player.play()
-        self._timer.start()
-        self.btn_play.setText("■ 停止")
-
-    def _on_play_tick(self) -> None:
-        if self._player is None:
-            return
-        pos = self._player.position()
-        self.lbl_pos.setText(ms_to_srt(pos))
-        if self._stop_at_ms > 0 and pos >= self._stop_at_ms:
-            self._player.pause()
-            self._timer.stop()
-            self.btn_play.setText("▶ 播放选中")
+    def _on_params_toggled(self, expanded: bool) -> None:
+        """展开参数时把预览窗收矮一点，否则文件列表会被挤得只剩一行。"""
+        self.preview.setFixedHeight(124 if expanded else 168)
 
     # ================================================================ 文件
 
@@ -527,27 +580,54 @@ class MainWindow(QMainWindow):
 
     def _add_files(self, paths: List[str]) -> None:
         added = 0
+        first_new = -1
         for p in paths:
-            if any(f["path"] == p for f in self._files):
+            if any(d.path == p for d in self.docs):
                 continue
-            item = {"path": p, "duration": 0.0, "status": "待处理"}
-            self._files.append(item)
+            doc = self._create_doc(p)
+            self.docs.append(doc)
+            if first_new < 0:
+                first_new = len(self.docs) - 1
             added += 1
-        if added:
-            self._refresh_file_list()
-            self._status(f"已添加 {added} 个文件")
-            if self.file_list.currentRow() < 0:
-                self.file_list.setCurrentRow(0)
-            self._probe_current()
+        if not added:
+            return
+
+        self._refresh_file_list()
+        self._status(f"已添加 {added} 个文件")
+        if self.file_list.currentRow() < 0:
+            self.file_list.setCurrentRow(0)
+        elif first_new >= 0:
+            self.file_list.setCurrentRow(first_new)
+
+    def _create_doc(self, path: str) -> Document:
+        doc = Document(path)
+        view = DocView()
+        view.set_hint(f"「{doc.name}」还没有转写结果。\n点左侧「开始转写」即可。")
+        view.playRequested.connect(self._on_row_play)
+        view.changed.connect(self._on_doc_edited)
+        doc.view = view
+        self.tabs.addTab(view, doc.name)
+        index = self.tabs.count() - 1
+        self.tabs.setTabToolTip(index, path)
+        return doc
 
     def _clear_files(self) -> None:
-        if not self._files:
+        if not self.docs:
             return
-        self._files.clear()
+        if self._worker is not None and self._worker.isRunning():
+            QMessageBox.information(self, "提示", "正在转写，请先取消再清空。")
+            return
+        for doc in self.docs:
+            TranscriptionPipeline.cleanup(doc.wav_path)
+        self._syncing = True
+        self.tabs.clear()
+        self.docs.clear()
+        self.current = None
+        self._syncing = False
+        self.preview.clear()
         self._refresh_file_list()
-        self.table.setRowCount(0)
-        self._cues = []
         self.btn_export.setEnabled(False)
+        self.btn_play.setEnabled(False)
         self.lbl_stat.setText("—")
         self._status("已清空")
 
@@ -555,16 +635,17 @@ class MainWindow(QMainWindow):
         self.file_list.blockSignals(True)
         cur = self.file_list.currentRow()
         self.file_list.clear()
-        for f in self._files:
-            name = os.path.basename(f["path"])
-            dur = self._fmt_dur(f["duration"])
-            it = QListWidgetItem(f"{name}\n{dur}  ·  {f['status']}")
-            it.setToolTip(f["path"])
+        for doc in self.docs:
+            mark = "●" if doc.done else "○"
+            dur = self._fmt_dur(doc.duration)
+            it = QListWidgetItem(f"{mark} {doc.name}\n{dur}  ·  {doc.status}")
+            it.setToolTip(doc.path)
             self.file_list.addItem(it)
         if 0 <= cur < self.file_list.count():
             self.file_list.setCurrentRow(cur)
         self.file_list.blockSignals(False)
-        self.lbl_count.setText(f"{len(self._files)} 个")
+        self.lbl_count.setText(f"{len(self.docs)} 个")
+        self.right_stack.setCurrentIndex(1 if self.docs else 0)
 
     @staticmethod
     def _fmt_dur(sec: float) -> str:
@@ -575,23 +656,56 @@ class MainWindow(QMainWindow):
         return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
 
     def _on_file_selected(self, row: int) -> None:
-        if 0 <= row < len(self._files):
-            self._probe_current()
-
-    def _probe_current(self) -> None:
-        row = self.file_list.currentRow()
-        if not (0 <= row < len(self._files)):
+        if self._syncing or not (0 <= row < len(self.docs)):
             return
-        f = self._files[row]
-        if f["duration"] > 0:
+        self._syncing = True
+        self.tabs.setCurrentIndex(row)
+        self._syncing = False
+        self._activate(self.docs[row])
+
+    def _on_tab_changed(self, index: int) -> None:
+        if self._syncing or not (0 <= index < len(self.docs)):
+            return
+        self._syncing = True
+        self.file_list.setCurrentRow(index)
+        self._syncing = False
+        self._activate(self.docs[index])
+
+    def _activate(self, doc: Document) -> None:
+        """切换当前文件：换预览源、换导出按钮状态。"""
+        if self.current is doc:
+            self._sync_doc_buttons(doc)
+            return
+        self.preview.pause()
+        self.current = doc
+        self._probe_doc(doc)
+        self.preview.load(doc.media_source(), doc.is_video)
+        self._sync_doc_buttons(doc)
+        if doc.result is not None:
+            self.lbl_stat.setText(
+                f"{len(doc.cues)} 条 · {self._fmt_dur(doc.result.duration_sec)}"
+                f" · {doc.result.model_name}"
+            )
+            self.lbl_stage.setText(f"{doc.name}：{len(doc.cues)} 条字幕")
+        else:
+            self.lbl_stat.setText("—")
+            self.lbl_stage.setText(f"{doc.name} · {doc.status}")
+
+    def _sync_doc_buttons(self, doc: Document) -> None:
+        self.btn_play.setEnabled(self.preview.available and bool(doc.cues))
+        self.btn_export.setEnabled(bool(doc.cues))
+
+    def _probe_doc(self, doc: Document) -> None:
+        if doc.duration > 0:
             return
         try:
-            info = probe(f["path"])
-            f["duration"] = info.duration_sec
-            f["status"] = "待处理" if info.has_audio else "无音轨"
+            info = probe(doc.path)
+            doc.duration = info.duration_sec
+            if not info.has_audio:
+                doc.status = "无音轨"
             self._refresh_file_list()
         except Exception as exc:
-            f["status"] = "读取失败"
+            doc.status = "读取失败"
             self._refresh_file_list()
             self._status(f"读取失败：{exc}")
 
@@ -619,17 +733,52 @@ class MainWindow(QMainWindow):
     def _start(self) -> None:
         if self._worker is not None and self._worker.isRunning():
             return
-        row = self.file_list.currentRow()
-        if not (0 <= row < len(self._files)):
-            QMessageBox.information(self, "提示", "请先添加并选择一个文件。")
+        if not self.docs:
+            QMessageBox.information(self, "提示", "请先添加文件。")
             return
 
-        f = self._files[row]
         try:
             find_ffmpeg()
         except Exception as exc:
             QMessageBox.critical(self, "缺少 ffmpeg", str(exc))
             return
+
+        # 队列：当前文件优先，其余未转写的一起排队
+        cur = self.current
+        pending = [d for d in self.docs if not d.done and d.status != "无音轨"]
+        if not pending and cur is not None and cur.done:
+            pending = [cur]        # 全转完了，允许重转当前这一个
+        if not pending:
+            QMessageBox.information(self, "提示", "所有文件都已转写完成。")
+            return
+        if cur in pending:
+            pending.remove(cur)
+            pending.insert(0, cur)
+
+        self._queue = pending
+        self._batch_total = len(pending)
+        self._batch_done = 0
+        self._batch_failed = 0
+        self._set_busy(True)
+        self._start_next()
+
+    def _start_next(self) -> None:
+        if not self._queue:
+            self._finish_batch()
+            return
+
+        doc = self._queue.pop(0)
+        self._worker_doc = doc
+        doc.status = "转写中"
+        self._refresh_file_list()
+        # 转写中的文件自动切到它的标签页，用户能立刻看到进度对应的文件
+        self._goto(doc)
+
+        self.progress.setValue(0)
+        self._set_progress_state(None)
+        idx = self.docs.index(doc) + 1
+        self._status(f"开始转写（{idx}/{self._batch_total}）：{doc.name}")
+        self.lbl_stage.setText(f"正在处理 {doc.name}")
 
         split = SplitOptions(
             max_chars=self.spin_chars.value(),
@@ -642,22 +791,24 @@ class MainWindow(QMainWindow):
             split=split,
         )
 
-        self._set_busy(True)
-        f["status"] = "转写中"
-        self._refresh_file_list()
-        self.progress.setValue(0)
-        self._set_progress_state(None)
-        self._status(f"开始转写：{os.path.basename(f['path'])}")
-
         engine = self._ensure_engine()
-        self._worker = TranscribeWorker(engine, f["path"], cfg, parent=self)
+        self._worker = TranscribeWorker(engine, doc.path, cfg, parent=self)
         self._worker.progressed.connect(self._on_progress)
         self._worker.succeeded.connect(self._on_success)
         self._worker.failed.connect(self._on_fail)
         self._worker.cancelled.connect(self._on_cancel)
         self._worker.start()
 
+    def _goto(self, doc: Document) -> None:
+        row = self.docs.index(doc)
+        self._syncing = True
+        self.file_list.setCurrentRow(row)
+        self.tabs.setCurrentIndex(row)
+        self._syncing = False
+        self._activate(doc)
+
     def _cancel(self) -> None:
+        self._queue.clear()
         if self._worker and self._worker.isRunning():
             self._worker.request_cancel()
             self._status("正在取消…")
@@ -678,7 +829,6 @@ class MainWindow(QMainWindow):
     }
 
     def _set_progress_state(self, state: str | None) -> None:
-        """切换进度条配色：进行中红、完成绿、失败红。"""
         self.progress.setProperty("done", state == "done")
         self.progress.setProperty("failed", state == "failed")
         self.progress.style().unpolish(self.progress)
@@ -693,119 +843,137 @@ class MainWindow(QMainWindow):
             self.lbl_stat.setText(f"已识别 {cues} 段")
 
     def _on_success(self, result) -> None:
-        self._result = result
-        self._cues = list(result.cues)
-        self._fill_table()
-        self._load_media(result.wav_path)
-        self.btn_play.setEnabled(self._player is not None)
-        self.btn_export.setEnabled(bool(self._cues))
-        self._set_busy(False)
+        doc = self._worker_doc
+        self._worker_doc = None
+        if doc is None:
+            return
+
+        doc.result = result
+        doc.wav_path = result.wav_path
+        doc.cues = list(result.cues)
+        if doc.view is not None:
+            doc.view.set_cues(doc.cues)
+        doc.status = f"完成 {len(doc.cues)} 条"
+        self._batch_done += 1
+        self._refresh_file_list()
+
+        if doc is self.current:
+            self.btn_export.setEnabled(bool(doc.cues))
+            self.btn_play.setEnabled(self.preview.available and bool(doc.cues))
+            self.preview.load(doc.media_source(), doc.is_video)
+            speed = result.duration_sec / max(result.elapsed_sec, 1e-6)
+            self.lbl_stage.setText(
+                f"完成：{len(doc.cues)} 条字幕，用时 {result.elapsed_sec:.1f}s"
+                f"（约 {speed:.1f}× 实时）"
+            )
+            self.lbl_stat.setText(
+                f"{len(doc.cues)} 条 · {self._fmt_dur(result.duration_sec)} · {result.model_name}"
+            )
+        self._status(f"{doc.name} 转写完成")
+
         self.progress.setValue(1000)
         self._set_progress_state("done")
-
-        row = self.file_list.currentRow()
-        if 0 <= row < len(self._files):
-            self._files[row]["status"] = f"完成 {len(self._cues)} 条"
-            self._refresh_file_list()
-
-        speed = result.duration_sec / max(result.elapsed_sec, 1e-6)
-        self.lbl_stage.setText(
-            f"完成：{len(self._cues)} 条字幕，用时 {result.elapsed_sec:.1f}s（约 {speed:.1f}× 实时）"
-        )
-        self.lbl_stat.setText(
-            f"{len(self._cues)} 条 · {self._fmt_dur(result.duration_sec)} · {result.model_name}"
-        )
-        self._status("转写完成")
+        self._start_next()
 
     def _on_fail(self, message: str) -> None:
-        self._set_busy(False)
+        doc = self._worker_doc
+        self._worker_doc = None
+        self._batch_failed += 1
+        if doc is not None:
+            doc.status = "失败"
+            if doc.view is not None:
+                doc.view.set_hint(f"「{doc.name}」转写失败\n{message}")
+            self._refresh_file_list()
         self.progress.setValue(1000)
         self._set_progress_state("failed")
         self.lbl_stage.setText("转写失败")
-        row = self.file_list.currentRow()
-        if 0 <= row < len(self._files):
-            self._files[row]["status"] = "失败"
-            self._refresh_file_list()
         self._status("转写失败")
-        QMessageBox.critical(self, "转写失败", message)
+        # 批量时不弹窗打断，最后统一汇总
+        if self._batch_total <= 1:
+            QMessageBox.critical(self, "转写失败", message)
+        self._start_next()
 
     def _on_cancel(self) -> None:
+        doc = self._worker_doc
+        self._worker_doc = None
+        if doc is not None and not doc.done:
+            doc.status = "已取消"
+        self._queue.clear()
         self._set_busy(False)
         self.progress.setValue(0)
         self._set_progress_state(None)
         self.lbl_stage.setText("已取消")
-        row = self.file_list.currentRow()
-        if 0 <= row < len(self._files):
-            self._files[row]["status"] = "已取消"
-            self._refresh_file_list()
+        self._refresh_file_list()
         self._status("已取消")
 
-    # ================================================================ 表格
+    def _finish_batch(self) -> None:
+        self._set_busy(False)
+        msg = f"全部完成：成功 {self._batch_done} 个"
+        if self._batch_failed:
+            msg += f"，失败 {self._batch_failed} 个"
+        self._status(msg)
+        self.lbl_stage.setText(msg)
 
-    def _fill_table(self) -> None:
-        self.table.blockSignals(True)
-        self.table.setRowCount(len(self._cues))
-        for r, c in enumerate(self._cues):
-            self._set_row(r, c)
-        self.table.blockSignals(False)
+    # ================================================================ 播放
 
-    def _set_row(self, r: int, c: Cue) -> None:
-        items = [
-            QTableWidgetItem(str(r + 1)),
-            QTableWidgetItem(ms_to_srt(c.start_ms)),
-            QTableWidgetItem(ms_to_srt(c.end_ms)),
-            QTableWidgetItem(f"{c.duration_ms / 1000:.2f}s"),
-            QTableWidgetItem(c.text),
-        ]
-        items[0].setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-        items[3].setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-        items[0].setTextAlignment(Qt.AlignCenter)
-        items[3].setTextAlignment(Qt.AlignCenter)
-        for col, it in enumerate(items):
-            self.table.setItem(r, col, it)
-
-    def _on_item_changed(self, item: QTableWidgetItem) -> None:
-        r, col = item.row(), item.column()
-        if not (0 <= r < len(self._cues)):
+    def _toggle_play(self) -> None:
+        doc = self.current
+        if doc is None or not doc.cues or not self.preview.available:
             return
-        cue = self._cues[r]
-        text = item.text()
+        view = doc.view
+        row = view.current_row() if view is not None else -1
+        if row < 0:
+            row = 0
+        self._on_row_play(row)
 
-        if col == 4:
-            if not text.strip():
-                return
-            self._cues[r] = Cue(cue.index, cue.start_ms, cue.end_ms, text)
-            self._dirty = True
-        elif col in (1, 2):
-            ms = parse_timecode(text)
-            if ms < 0:
-                self.table.blockSignals(True)
-                self.table.setItem(r, col, QTableWidgetItem(
-                    ms_to_srt(cue.start_ms if col == 1 else cue.end_ms)))
-                self.table.blockSignals(False)
-                return
-            if col == 1:
-                self._cues[r] = Cue(cue.index, ms, max(ms + 300, cue.end_ms), cue.text)
-            else:
-                self._cues[r] = Cue(cue.index, cue.start_ms, max(cue.start_ms + 300, ms), cue.text)
-            self._dirty = True
-        else:
+    def _on_row_play(self, row: int) -> None:
+        doc = self.current
+        if doc is None or not (0 <= row < len(doc.cues)):
             return
-
-        self.table.blockSignals(True)
-        self._set_row(r, self._cues[r])
-        self.table.blockSignals(False)
-
-    def _on_cell_clicked(self, row: int, col: int) -> None:
-        if col == 4 or self._player is None:
+        if not self.preview.available:
+            self._status("播放组件不可用")
             return
-        self._play_row(row)
+        cue = doc.cues[row]
+        # 提前 150ms 起播，避免开头吞字
+        self.preview.play_from(max(0, cue.start_ms - 150), cue.end_ms)
+
+    def _on_preview_pos(self, pos: int) -> None:
+        self.lbl_pos.setText(ms_to_srt(pos))
+        doc = self.current
+        if doc is None or not doc.cues or doc.view is None:
+            return
+        # 播放时让表格跟着走，标出当前这句
+        if not self.preview.is_playing:
+            return
+        for i, cue in enumerate(doc.cues):
+            if cue.start_ms <= pos < cue.end_ms:
+                doc.view.highlight_row(i)
+                break
+
+    def _on_playing_changed(self, playing: bool) -> None:
+        self.btn_play.setText("■ 停止" if playing else "▶ 播放选中")
+        self.btn_play_prev.setText("■ 停止" if playing else "▶ 播放")
+        if not playing:
+            self.preview.set_stop_at(-1)
+
+    # ================================================================ 编辑
+
+    def _on_doc_edited(self) -> None:
+        doc = self.current
+        if doc is None:
+            return
+        doc.dirty = True
+        if doc.view is not None:
+            doc.cues = doc.view.cues
+        self.lbl_stat.setText(f"{len(doc.cues)} 条（已手工修改）")
 
     # ================================================================ 导出
 
     def _export(self) -> None:
-        if not self._cues:
+        doc = self.current
+        if doc is None or not doc.cues:
             return
+        cues = doc.view.cues if doc.view is not None else doc.cues
 
         formats = []
         if self.chk_srt.isChecked():
@@ -818,8 +986,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "请至少勾选一种导出格式。")
             return
 
-        src = self._result.source_path if self._result else ""
-        default_dir = os.path.dirname(src) if src else os.path.expanduser("~")
+        default_dir = os.path.dirname(doc.path) or os.path.expanduser("~")
         out_dir = QFileDialog.getExistingDirectory(self, "选择导出目录", default_dir)
         if not out_dir:
             return
@@ -832,7 +999,7 @@ class MainWindow(QMainWindow):
             keep_punctuation=self.chk_punct.isChecked(),
         )
 
-        problems = exporters.validate(self._cues)
+        problems = exporters.validate(cues)
         if problems:
             head = "\n".join(problems[:8])
             more = f"\n… 另有 {len(problems) - 8} 条问题" if len(problems) > 8 else ""
@@ -845,7 +1012,7 @@ class MainWindow(QMainWindow):
                 return
 
         try:
-            written = exporters.export(self._cues, opt, src or "subtitle", out_dir)
+            written = exporters.export(cues, opt, doc.path, out_dir)
         except Exception as exc:
             QMessageBox.critical(self, "导出失败", f"{type(exc).__name__}: {exc}")
             return
@@ -868,12 +1035,13 @@ class MainWindow(QMainWindow):
 
     def _refresh_model_badge(self) -> None:
         kind, _ = resolve_model()
+        colors = palette(self.theme)
         if kind == "sensevoice":
             self.badge_model.setText("● 模型已就绪 · SenseVoice")
-            self.badge_model.setStyleSheet(f"color: {COLORS['ok']};")
+            self.badge_model.setStyleSheet(f"color: {colors['ok']};")
         else:
             self.badge_model.setText("● 未找到模型 · 演示模式")
-            self.badge_model.setStyleSheet(f"color: {COLORS['warn']};")
+            self.badge_model.setStyleSheet(f"color: {colors['warn']};")
             self.badge_model.setToolTip(
                 "把模型放到 models/sensevoice/ 目录后重启即可启用真实识别：\n"
                 "model.int8.onnx + tokens.txt"
@@ -893,8 +1061,7 @@ class MainWindow(QMainWindow):
                 return
             self._worker.request_cancel()
             self._worker.wait(3000)
-        if self._result is not None:
-            from ..core.pipeline import TranscriptionPipeline
-
-            TranscriptionPipeline.cleanup(self._result.wav_path)
+        for doc in self.docs:
+            TranscriptionPipeline.cleanup(doc.wav_path)
+        self.settings.sync()
         event.accept()
