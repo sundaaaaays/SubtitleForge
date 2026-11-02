@@ -68,7 +68,7 @@
 
 ```
 文件：SubtitleForge-v0.2.0-win64.zip
-SHA256：占位
+SHA256：09c3389deb8177f6558b77eda408aa53a2219433ff36fcf7b1b4e36fddada870
 ```
 
 PowerShell 校验：`Get-FileHash .\SubtitleForge-v0.2.0-win64.zip -Algorithm SHA256`
